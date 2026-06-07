@@ -1,0 +1,5 @@
+{
+  "name": "Sensors to Weather",
+  "description": "Turns local sensors into a native weather entity.",
+  "render_readme": true
+}
