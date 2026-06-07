@@ -14,7 +14,6 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_change,
 )
-import homeassistant.util.dt as dt_util
 
 from .const import (
     DOMAIN,
@@ -26,11 +25,10 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Condition decision tree thresholds
-PRECIP_THRESHOLD = 0.1      # mm — above this → rainy
-WIND_STRONG_THRESHOLD = 50  # km/h — above this → windy
-CLOUD_OVERCAST = 80         # % — above this → cloudy
-CLOUD_CLEAR = 20            # % — below this → sunny/clear-night
+PRECIP_THRESHOLD = 0.1
+WIND_STRONG_THRESHOLD = 50
+CLOUD_OVERCAST = 80
+CLOUD_CLEAR = 20
 
 
 async def async_setup_entry(
@@ -38,7 +36,6 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the Sensors to Weather entity."""
     sensors = entry.options.get("sensors", entry.data.get("sensors", []))
     name = entry.options.get("name", entry.data.get("name", "Station météo"))
     async_add_entities([SensorsToWeatherEntity(hass, entry, sensors, name)])
@@ -55,20 +52,12 @@ class SensorsToWeatherEntity(WeatherEntity):
     _attr_native_visibility_unit = "km"
     _attr_native_precipitation_unit = "mm"
 
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        entry: ConfigEntry,
-        sensors: list[str],
-        name: str,
-    ):
+    def __init__(self, hass, entry, sensors, name):
         self.hass = hass
         self._entry = entry
         self._sensors = sensors
         self._attr_unique_id = entry.entry_id
         self._attr_name = name
-
-        # Current values
         self._attr_condition = None
         self._attr_native_temperature = None
         self._attr_humidity = None
@@ -80,15 +69,15 @@ class SensorsToWeatherEntity(WeatherEntity):
         self._attr_native_visibility = None
         self._attr_native_dew_point = None
         self._attr_native_apparent_temperature = None
-
-        # Daily min/max temperature
         self._temp_min: float | None = None
         self._temp_max: float | None = None
-
-        self._update()
+        # Safe initial update
+        try:
+            self._update()
+        except Exception as err:
+            _LOGGER.exception("Error during initial update: %s", err)
 
     async def async_added_to_hass(self) -> None:
-        """Start listening to sensor state changes and schedule midnight reset."""
         self.async_on_remove(
             async_track_state_change_event(
                 self.hass,
@@ -96,7 +85,6 @@ class SensorsToWeatherEntity(WeatherEntity):
                 self._handle_sensor_update,
             )
         )
-        # Reset daily min/max at midnight
         self.async_on_remove(
             async_track_time_change(
                 self.hass,
@@ -107,23 +95,26 @@ class SensorsToWeatherEntity(WeatherEntity):
 
     @callback
     def _handle_sensor_update(self, event) -> None:
-        """Called when any source sensor changes state."""
-        self._update()
-        self.async_write_ha_state()
+        try:
+            self._update()
+            self.async_write_ha_state()
+        except Exception as err:
+            _LOGGER.exception("Error handling sensor update: %s", err)
 
     @callback
     def _handle_midnight_reset(self, _now=None) -> None:
-        """Reset daily min/max at midnight."""
-        _LOGGER.debug("Midnight reset of daily temperature min/max.")
-        self._temp_min = None
-        self._temp_max = None
-        self.async_write_ha_state()
+        try:
+            _LOGGER.debug("Midnight reset of daily temperature min/max.")
+            self._temp_min = None
+            self._temp_max = None
+            self.async_write_ha_state()
+        except Exception as err:
+            _LOGGER.exception("Error during midnight reset: %s", err)
 
-    # ── Static helpers ────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
     def _median(values: list) -> float | None:
-        """Compute median ignoring None values."""
         clean = [v for v in values if v is not None]
         if not clean:
             return None
@@ -131,7 +122,6 @@ class SensorsToWeatherEntity(WeatherEntity):
 
     @staticmethod
     def _circular_median(bearings: list) -> float | None:
-        """Compute circular average of angles in degrees, ignoring None values."""
         clean = [b for b in bearings if b is not None]
         if not clean:
             return None
@@ -140,45 +130,42 @@ class SensorsToWeatherEntity(WeatherEntity):
         return round(math.degrees(math.atan2(sin_avg, cos_avg)) % 360, 1)
 
     @staticmethod
-    def _compute_dew_point(temp: float | None, humidity: float | None) -> float | None:
-        """Magnus formula."""
+    def _compute_dew_point(temp, humidity):
         if temp is None or humidity is None or humidity <= 0:
             return None
-        gamma = math.log(humidity / 100) + (7.5 * temp) / (237.7 + temp)
-        return round(237.7 * gamma / (7.5 - gamma), 1)
+        try:
+            gamma = math.log(humidity / 100) + (7.5 * temp) / (237.7 + temp)
+            return round(237.7 * gamma / (7.5 - gamma), 1)
+        except Exception:
+            return None
 
     @staticmethod
-    def _compute_apparent_temp(temp: float | None, dew_point: float | None) -> float | None:
-        """Steadman formula."""
+    def _compute_apparent_temp(temp, dew_point):
         if temp is None or dew_point is None:
             return None
-        e = 6.11 * (10 ** ((7.5 * dew_point) / (237.7 + dew_point)))
-        return round(temp + 0.5555 * (e - 10), 1)
+        try:
+            e = 6.11 * (10 ** ((7.5 * dew_point) / (237.7 + dew_point)))
+            return round(temp + 0.5555 * (e - 10), 1)
+        except Exception:
+            return None
 
-    def _compute_condition(
-        self,
-        precipitation: float | None,
-        wind_speed: float | None,
-        cloud_coverage: float | None,
-        temperature: float | None,
-    ) -> str | None:
-        """Derive weather condition from available sensor data."""
-        # Priority order: precipitation > wind > clouds > clear
-        if precipitation is not None and precipitation > PRECIP_THRESHOLD:
-            return "rainy"
-        if wind_speed is not None and wind_speed > WIND_STRONG_THRESHOLD:
-            return "windy"
-        if cloud_coverage is not None:
-            if cloud_coverage > CLOUD_OVERCAST:
-                return "cloudy"
-            if cloud_coverage < CLOUD_CLEAR:
-                # Day/night distinction based on sun elevation
-                sun = self.hass.states.get("sun.sun")
-                if sun and sun.state == "below_horizon":
-                    return "clear-night"
-                return "sunny"
-            return "partlycloudy"
-        # Not enough data to determine condition
+    def _compute_condition(self, precipitation, wind_speed, cloud_coverage, temperature):
+        try:
+            if precipitation is not None and precipitation > PRECIP_THRESHOLD:
+                return "rainy"
+            if wind_speed is not None and wind_speed > WIND_STRONG_THRESHOLD:
+                return "windy"
+            if cloud_coverage is not None:
+                if cloud_coverage > CLOUD_OVERCAST:
+                    return "cloudy"
+                if cloud_coverage < CLOUD_CLEAR:
+                    sun = self.hass.states.get("sun.sun")
+                    if sun and sun.state == "below_horizon":
+                        return "clear-night"
+                    return "sunny"
+                return "partlycloudy"
+        except Exception as err:
+            _LOGGER.debug("Error computing condition: %s", err)
         return None
 
     # ── Main update ───────────────────────────────────────────────────────────
@@ -198,21 +185,20 @@ class SensorsToWeatherEntity(WeatherEntity):
         }
 
         for entity_id in self._sensors:
-            state = self.hass.states.get(entity_id)
-            if state is None or state.state in ("unavailable", "unknown", ""):
-                continue
             try:
+                state = self.hass.states.get(entity_id)
+                if state is None or state.state in ("unavailable", "unknown", ""):
+                    continue
                 value = float(state.state)
+                role = detect_role(state)
+                if role is None:
+                    _LOGGER.debug("Sensor %s: unrecognized role, skipping.", entity_id)
+                    continue
+                by_role[role].append(value)
             except (ValueError, TypeError):
                 _LOGGER.debug("Sensor %s has non-numeric state, skipping.", entity_id)
-                continue
-
-            role = detect_role(state)
-            if role is None:
-                _LOGGER.debug("Sensor %s: unrecognized role, skipping.", entity_id)
-                continue
-
-            by_role[role].append(value)
+            except Exception as err:
+                _LOGGER.warning("Unexpected error reading sensor %s: %s", entity_id, err)
 
         # Aggregate
         temp = self._median(by_role[ROLE_TEMPERATURE])
@@ -227,7 +213,6 @@ class SensorsToWeatherEntity(WeatherEntity):
         self._attr_cloud_coverage = self._median(by_role[ROLE_CLOUD_COVERAGE])
         self._attr_native_visibility = self._median(by_role[ROLE_VISIBILITY])
 
-        # Dew point and apparent temp only if we have real humidity data
         if humidity is not None:
             self._attr_native_dew_point = self._compute_dew_point(temp, humidity)
             self._attr_native_apparent_temperature = self._compute_apparent_temp(
@@ -237,7 +222,6 @@ class SensorsToWeatherEntity(WeatherEntity):
             self._attr_native_dew_point = None
             self._attr_native_apparent_temperature = None
 
-        # Condition from available data
         self._attr_condition = self._compute_condition(
             self._median(by_role[ROLE_PRECIPITATION]),
             self._attr_native_wind_speed,
@@ -245,25 +229,22 @@ class SensorsToWeatherEntity(WeatherEntity):
             temp,
         )
 
-        # Daily min/max temperature tracking
         if temp is not None:
             if self._temp_min is None or temp < self._temp_min:
                 self._temp_min = temp
             if self._temp_max is None or temp > self._temp_max:
                 self._temp_max = temp
 
-        # Mark available if we have at least temperature
         self._attr_available = temp is not None
 
         _LOGGER.debug(
-            "Updated: temp=%s (min=%s, max=%s), humidity=%s, condition=%s",
+            "Updated: temp=%s (min=%s, max=%s), humidity=%s, pressure=%s, condition=%s",
             temp, self._temp_min, self._temp_max,
-            humidity, self._attr_condition,
+            humidity, self._attr_native_pressure, self._attr_condition,
         )
 
     @property
     def extra_state_attributes(self) -> dict:
-        """Expose daily min/max as extra attributes."""
         return {
             "temperature_min": self._temp_min,
             "temperature_max": self._temp_max,
