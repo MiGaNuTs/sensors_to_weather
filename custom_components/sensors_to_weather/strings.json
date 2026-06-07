@@ -1,0 +1,30 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Sensors to Weather",
+        "description": "Sélectionnez les sensors à agréger en entité météo. Les rôles sont détectés automatiquement via device_class et unité.",
+        "data": {
+          "name": "Nom de l'entité",
+          "sensors": "Sensors sources"
+        }
+      }
+    },
+    "error": {
+      "no_sensors": "Sélectionnez au moins un sensor."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Modifier les sensors",
+        "data": {
+          "sensors": "Sensors sources"
+        }
+      }
+    },
+    "error": {
+      "no_sensors": "Sélectionnez au moins un sensor."
+    }
+  }
+}

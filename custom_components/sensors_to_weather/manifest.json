@@ -1,0 +1,10 @@
+{
+  "domain": "sensors_to_weather",
+  "name": "Sensors to Weather",
+  "version": "0.1.0",
+  "config_flow": true,
+  "dependencies": [],
+  "requirements": [],
+  "codeowners": ["@MiGaNuTs"],
+  "iot_class": "local_push"
+}
