@@ -78,18 +78,24 @@ class SensorsToWeatherEntity(WeatherEntity):
             _LOGGER.exception("Error during initial update: %s", err)
 
     async def async_added_to_hass(self) -> None:
-        self.async_on_remove(
-            async_track_state_change_event(
-                self.hass,
-                self._sensors,
-                self._handle_sensor_update,
-            )
-        )
+        self._setup_tracking()
         self.async_on_remove(
             async_track_time_change(
                 self.hass,
                 self._handle_midnight_reset,
                 hour=0, minute=0, second=0,
+            )
+        )
+
+    def _setup_tracking(self) -> None:
+        """Set up state change tracking for current sensor list."""
+        if not self._sensors:
+            return
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass,
+                self._sensors,
+                self._handle_sensor_update,
             )
         )
 
