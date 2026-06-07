@@ -12,7 +12,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import (
     async_track_state_change_event,
-    async_track_time,
+    async_track_time_change,
 )
 import homeassistant.util.dt as dt_util
 
@@ -98,10 +98,10 @@ class SensorsToWeatherEntity(WeatherEntity):
         )
         # Reset daily min/max at midnight
         self.async_on_remove(
-            async_track_time(
+            async_track_time_change(
                 self.hass,
                 self._handle_midnight_reset,
-                time(0, 0, 0),
+                hour=0, minute=0, second=0,
             )
         )
 
