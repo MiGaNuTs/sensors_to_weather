@@ -19,7 +19,7 @@ from .const import (
     DOMAIN,
     ROLE_TEMPERATURE, ROLE_HUMIDITY, ROLE_PRESSURE,
     ROLE_WIND_SPEED, ROLE_WIND_GUST, ROLE_WIND_BEARING,
-    ROLE_VISIBILITY, ROLE_CLOUD_COVERAGE, ROLE_PRECIPITATION,
+    ROLE_VISIBILITY, ROLE_CLOUD_COVERAGE, ROLE_PRECIPITATION, ROLE_PRECIPITATION_RATE,
     detect_role,
 )
 
@@ -188,6 +188,7 @@ class SensorsToWeatherEntity(WeatherEntity):
             ROLE_VISIBILITY: [],
             ROLE_CLOUD_COVERAGE: [],
             ROLE_PRECIPITATION: [],
+            ROLE_PRECIPITATION_RATE: [],
         }
 
         for entity_id in self._sensors:
@@ -229,7 +230,7 @@ class SensorsToWeatherEntity(WeatherEntity):
             self._attr_native_apparent_temperature = None
 
         self._attr_condition = self._compute_condition(
-            self._median(by_role[ROLE_PRECIPITATION]),
+            self._median(by_role[ROLE_PRECIPITATION_RATE]),
             self._attr_native_wind_speed,
             self._attr_cloud_coverage,
             temp,

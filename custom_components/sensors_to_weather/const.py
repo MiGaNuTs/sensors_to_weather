@@ -12,12 +12,14 @@ ROLE_WIND_BEARING = "wind_bearing"
 ROLE_VISIBILITY = "visibility"
 ROLE_CLOUD_COVERAGE = "cloud_coverage"
 ROLE_PRECIPITATION = "precipitation"
+ROLE_PRECIPITATION_RATE = "precipitation_rate"
 
 TEMPERATURE_UNITS = {"°C", "°F", "K"}
 PRESSURE_UNITS = {"hPa", "mbar", "Pa", "inHg"}
 WIND_SPEED_UNITS = {"km/h", "m/s", "mph", "kn"}
 VISIBILITY_UNITS = {"km", "mi", "m"}
 PRECIPITATION_UNITS = {"mm", "in"}
+PRECIPITATION_RATE_UNITS = {"mm/h", "in/h"}
 
 
 def detect_role(state) -> str | None:
@@ -54,6 +56,9 @@ def detect_role(state) -> str | None:
 
     if dc == "cloud_coverage" or ("cloud" in entity_id and unit == "%"):
         return ROLE_CLOUD_COVERAGE
+
+    if dc == "precipitation_intensity" or unit in PRECIPITATION_RATE_UNITS:
+        return ROLE_PRECIPITATION_RATE
 
     if dc == "precipitation" or unit in PRECIPITATION_UNITS:
         return ROLE_PRECIPITATION
