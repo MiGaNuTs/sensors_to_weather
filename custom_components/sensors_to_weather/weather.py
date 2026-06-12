@@ -19,16 +19,18 @@ from .const import (
     DOMAIN,
     ROLE_TEMPERATURE, ROLE_HUMIDITY, ROLE_PRESSURE,
     ROLE_WIND_SPEED, ROLE_WIND_GUST, ROLE_WIND_BEARING,
-    ROLE_VISIBILITY, ROLE_CLOUD_COVERAGE, ROLE_PRECIPITATION, ROLE_PRECIPITATION_RATE,
+    ROLE_VISIBILITY, ROLE_CLOUD_COVERAGE, ROLE_PRECIPITATION,
+    ROLE_PRECIPITATION_RATE, ROLE_CONDITION,
     detect_role,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-PRECIP_THRESHOLD = 0.1
-WIND_STRONG_THRESHOLD = 50
-CLOUD_OVERCAST = 80
-CLOUD_CLEAR = 20
+CONDITION_VALUES = {
+    "sunny", "clear-night", "partlycloudy", "windy-variant", "windy",
+    "fog", "cloudy", "hail", "snowy", "snowy-rainy", "rainy",
+    "pouring", "lightning", "lightning-rainy", "exceptional",
+}
 
 
 async def async_setup_entry(
@@ -71,7 +73,6 @@ class SensorsToWeatherEntity(WeatherEntity):
         self._attr_native_apparent_temperature = None
         self._temp_min: float | None = None
         self._temp_max: float | None = None
-        # Safe initial update
         try:
             self._update()
         except Exception as err:
@@ -88,7 +89,6 @@ class SensorsToWeatherEntity(WeatherEntity):
         )
 
     def _setup_tracking(self) -> None:
-        """Set up state change tracking for current sensor list."""
         if not self._sensors:
             return
         self.async_on_remove(
@@ -155,30 +155,10 @@ class SensorsToWeatherEntity(WeatherEntity):
         except Exception:
             return None
 
-    def _compute_condition(self, precipitation, wind_speed, cloud_coverage, temperature):
-        try:
-            if precipitation is not None and precipitation > PRECIP_THRESHOLD:
-                return "rainy"
-            if wind_speed is not None and wind_speed > WIND_STRONG_THRESHOLD:
-                return "windy"
-            if cloud_coverage is not None:
-                if cloud_coverage > CLOUD_OVERCAST:
-                    return "cloudy"
-                if cloud_coverage < CLOUD_CLEAR:
-                    sun = self.hass.states.get("sun.sun")
-                    if sun and sun.state == "below_horizon":
-                        return "clear-night"
-                    return "sunny"
-                return "partlycloudy"
-        except Exception as err:
-            _LOGGER.debug("Error computing condition: %s", err)
-        return None
-
     # ── Main update ───────────────────────────────────────────────────────────
 
     def _update(self) -> None:
-        """Read all sensors, detect roles, compute aggregated values."""
-        by_role: dict[str, list[float]] = {
+        by_role: dict[str, list] = {
             ROLE_TEMPERATURE: [],
             ROLE_HUMIDITY: [],
             ROLE_PRESSURE: [],
@@ -189,6 +169,7 @@ class SensorsToWeatherEntity(WeatherEntity):
             ROLE_CLOUD_COVERAGE: [],
             ROLE_PRECIPITATION: [],
             ROLE_PRECIPITATION_RATE: [],
+            ROLE_CONDITION: [],
         }
 
         for entity_id in self._sensors:
@@ -196,18 +177,31 @@ class SensorsToWeatherEntity(WeatherEntity):
                 state = self.hass.states.get(entity_id)
                 if state is None or state.state in ("unavailable", "unknown", ""):
                     continue
-                value = float(state.state)
+
+                # Condition sensor — entity_id ends with _state
+                if entity_id.endswith("_state"):
+                    if state.state in CONDITION_VALUES:
+                        by_role[ROLE_CONDITION].append(state.state)
+                    continue
+
                 role = detect_role(state)
                 if role is None:
                     _LOGGER.debug("Sensor %s: unrecognized role, skipping.", entity_id)
                     continue
+
+                # All other roles — numeric value
+                try:
+                    value = float(state.state)
+                except (ValueError, TypeError):
+                    _LOGGER.debug("Sensor %s has non-numeric state, skipping.", entity_id)
+                    continue
+
                 by_role[role].append(value)
-            except (ValueError, TypeError):
-                _LOGGER.debug("Sensor %s has non-numeric state, skipping.", entity_id)
+
             except Exception as err:
                 _LOGGER.warning("Unexpected error reading sensor %s: %s", entity_id, err)
 
-        # Aggregate
+        # Aggregate numeric values
         temp = self._median(by_role[ROLE_TEMPERATURE])
         humidity = self._median(by_role[ROLE_HUMIDITY])
 
@@ -220,6 +214,11 @@ class SensorsToWeatherEntity(WeatherEntity):
         self._attr_cloud_coverage = self._median(by_role[ROLE_CLOUD_COVERAGE])
         self._attr_native_visibility = self._median(by_role[ROLE_VISIBILITY])
 
+        # Condition — use provided sensor directly, no guessing
+        conditions = by_role[ROLE_CONDITION]
+        self._attr_condition = conditions[0] if conditions else None
+
+        # Dew point and apparent temp only if humidity available
         if humidity is not None:
             self._attr_native_dew_point = self._compute_dew_point(temp, humidity)
             self._attr_native_apparent_temperature = self._compute_apparent_temp(
@@ -229,13 +228,7 @@ class SensorsToWeatherEntity(WeatherEntity):
             self._attr_native_dew_point = None
             self._attr_native_apparent_temperature = None
 
-        self._attr_condition = self._compute_condition(
-            self._median(by_role[ROLE_PRECIPITATION_RATE]),
-            self._attr_native_wind_speed,
-            self._attr_cloud_coverage,
-            temp,
-        )
-
+        # Daily min/max temperature tracking
         if temp is not None:
             if self._temp_min is None or temp < self._temp_min:
                 self._temp_min = temp
@@ -245,9 +238,9 @@ class SensorsToWeatherEntity(WeatherEntity):
         self._attr_available = temp is not None
 
         _LOGGER.debug(
-            "Updated: temp=%s (min=%s, max=%s), humidity=%s, pressure=%s, condition=%s",
+            "Updated: temp=%s (min=%s, max=%s), humidity=%s, condition=%s",
             temp, self._temp_min, self._temp_max,
-            humidity, self._attr_native_pressure, self._attr_condition,
+            humidity, self._attr_condition,
         )
 
     @property
