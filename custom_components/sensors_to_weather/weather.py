@@ -248,4 +248,5 @@ class SensorsToWeatherEntity(WeatherEntity):
         return {
             "temperature_min": self._temp_min,
             "temperature_max": self._temp_max,
+            "temperature_unit": self._attr_native_temperature_unit,
         }
