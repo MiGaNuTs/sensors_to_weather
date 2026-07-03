@@ -4,7 +4,8 @@ from __future__ import annotations
 import logging
 import math
 import statistics
-from datetime import time
+from collections import Counter
+from datetime import time, timedelta
 
 from homeassistant.components.weather import WeatherEntity
 from homeassistant.config_entries import ConfigEntry
@@ -13,6 +14,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_change,
+    async_track_time_interval,
 )
 from homeassistant.helpers.restore_state import RestoreEntity
 import homeassistant.util.dt as dt_util
@@ -33,6 +35,21 @@ CONDITION_VALUES = {
     "fog", "cloudy", "hail", "snowy", "snowy-rainy", "rainy",
     "pouring", "lightning", "lightning-rainy", "exceptional",
 }
+
+ALL_ROLES = [
+    ROLE_TEMPERATURE, ROLE_HUMIDITY, ROLE_PRESSURE,
+    ROLE_WIND_SPEED, ROLE_WIND_GUST, ROLE_WIND_BEARING,
+    ROLE_VISIBILITY, ROLE_CLOUD_COVERAGE, ROLE_PRECIPITATION,
+    ROLE_PRECIPITATION_RATE, ROLE_CONDITION,
+]
+
+# One published state per minute, aggregated from every raw sample collected
+# during that window — smooths out noisy sensors emitting several points/min.
+PUBLISH_INTERVAL = timedelta(minutes=1)
+
+# Modified z-score threshold (Iglewicz & Hoaglin) for rejecting outliers
+# within a single aggregation window before taking the median.
+OUTLIER_THRESHOLD = 3.5
 
 
 async def async_setup_entry(
@@ -75,8 +92,10 @@ class SensorsToWeatherEntity(WeatherEntity, RestoreEntity):
         self._attr_native_apparent_temperature = None
         self._temp_min: float | None = None
         self._temp_max: float | None = None
+        self._buffers: dict[str, list] = {role: [] for role in ALL_ROLES}
         try:
-            self._update()
+            self._collect_sample()
+            self._flush()
         except Exception as err:
             _LOGGER.exception("Error during initial update: %s", err)
 
@@ -89,6 +108,13 @@ class SensorsToWeatherEntity(WeatherEntity, RestoreEntity):
                 self.hass,
                 self._handle_midnight_reset,
                 hour=0, minute=0, second=0,
+            )
+        )
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass,
+                self._handle_flush,
+                PUBLISH_INTERVAL,
             )
         )
 
@@ -128,10 +154,17 @@ class SensorsToWeatherEntity(WeatherEntity, RestoreEntity):
     @callback
     def _handle_sensor_update(self, event) -> None:
         try:
-            self._update()
+            self._collect_sample()
+        except Exception as err:
+            _LOGGER.exception("Error collecting sensor sample: %s", err)
+
+    @callback
+    def _handle_flush(self, _now=None) -> None:
+        try:
+            self._flush()
             self.async_write_ha_state()
         except Exception as err:
-            _LOGGER.exception("Error handling sensor update: %s", err)
+            _LOGGER.exception("Error flushing aggregated weather state: %s", err)
 
     @callback
     def _handle_midnight_reset(self, _now=None) -> None:
@@ -144,6 +177,24 @@ class SensorsToWeatherEntity(WeatherEntity, RestoreEntity):
             _LOGGER.exception("Error during midnight reset: %s", err)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _reject_outliers(values: list, threshold: float = OUTLIER_THRESHOLD) -> list:
+        """Drop samples too far from the median (modified z-score via MAD).
+
+        Needs at least 3 samples to say anything meaningful about outliers;
+        below that, everything is kept as-is.
+        """
+        clean = [v for v in values if v is not None]
+        if len(clean) < 3:
+            return clean
+        med = statistics.median(clean)
+        abs_devs = [abs(v - med) for v in clean]
+        mad = statistics.median(abs_devs)
+        if mad == 0:
+            return clean
+        filtered = [v for v, d in zip(clean, abs_devs) if (0.6745 * d / mad) <= threshold]
+        return filtered if filtered else clean
 
     @staticmethod
     def _median(values: list) -> float | None:
@@ -181,23 +232,10 @@ class SensorsToWeatherEntity(WeatherEntity, RestoreEntity):
         except Exception:
             return None
 
-    # ── Main update ───────────────────────────────────────────────────────────
+    # ── Sampling (called on every source sensor change) ─────────────────────
 
-    def _update(self) -> None:
-        by_role: dict[str, list] = {
-            ROLE_TEMPERATURE: [],
-            ROLE_HUMIDITY: [],
-            ROLE_PRESSURE: [],
-            ROLE_WIND_SPEED: [],
-            ROLE_WIND_GUST: [],
-            ROLE_WIND_BEARING: [],
-            ROLE_VISIBILITY: [],
-            ROLE_CLOUD_COVERAGE: [],
-            ROLE_PRECIPITATION: [],
-            ROLE_PRECIPITATION_RATE: [],
-            ROLE_CONDITION: [],
-        }
-
+    def _collect_sample(self) -> None:
+        """Read current source states and append raw values to the buffers."""
         for entity_id in self._sensors:
             try:
                 state = self.hass.states.get(entity_id)
@@ -207,7 +245,7 @@ class SensorsToWeatherEntity(WeatherEntity, RestoreEntity):
                 # Condition sensor — entity_id ends with _state
                 if entity_id.endswith("_state"):
                     if state.state in CONDITION_VALUES:
-                        by_role[ROLE_CONDITION].append(state.state)
+                        self._buffers[ROLE_CONDITION].append(state.state)
                     continue
 
                 role = detect_role(state)
@@ -222,27 +260,37 @@ class SensorsToWeatherEntity(WeatherEntity, RestoreEntity):
                     _LOGGER.debug("Sensor %s has non-numeric state, skipping.", entity_id)
                     continue
 
-                by_role[role].append(value)
+                self._buffers[role].append(value)
 
             except Exception as err:
                 _LOGGER.warning("Unexpected error reading sensor %s: %s", entity_id, err)
 
-        # Aggregate numeric values
-        temp = self._median(by_role[ROLE_TEMPERATURE])
-        humidity = self._median(by_role[ROLE_HUMIDITY])
+    # ── Flush (called once per PUBLISH_INTERVAL) ─────────────────────────────
+
+    def _flush(self) -> None:
+        """Aggregate the buffered samples into the published state."""
+        buffers = self._buffers
+        self._buffers = {role: [] for role in ALL_ROLES}
+
+        # Aggregate numeric values — outliers dropped before taking the median
+        temp = self._median(self._reject_outliers(buffers[ROLE_TEMPERATURE]))
+        humidity = self._median(self._reject_outliers(buffers[ROLE_HUMIDITY]))
 
         self._attr_native_temperature = temp
         self._attr_humidity = humidity
-        self._attr_native_pressure = self._median(by_role[ROLE_PRESSURE])
-        self._attr_native_wind_speed = self._median(by_role[ROLE_WIND_SPEED])
-        self._attr_native_wind_gust_speed = self._median(by_role[ROLE_WIND_GUST])
-        self._attr_wind_bearing = self._circular_median(by_role[ROLE_WIND_BEARING])
-        self._attr_cloud_coverage = self._median(by_role[ROLE_CLOUD_COVERAGE])
-        self._attr_native_visibility = self._median(by_role[ROLE_VISIBILITY])
+        self._attr_native_pressure = self._median(self._reject_outliers(buffers[ROLE_PRESSURE]))
+        self._attr_native_wind_speed = self._median(self._reject_outliers(buffers[ROLE_WIND_SPEED]))
+        self._attr_native_wind_gust_speed = self._median(self._reject_outliers(buffers[ROLE_WIND_GUST]))
+        # Circular data (bearing) isn't compatible with the MAD rejection above.
+        self._attr_wind_bearing = self._circular_median(buffers[ROLE_WIND_BEARING])
+        self._attr_cloud_coverage = self._median(self._reject_outliers(buffers[ROLE_CLOUD_COVERAGE]))
+        self._attr_native_visibility = self._median(self._reject_outliers(buffers[ROLE_VISIBILITY]))
 
-        # Condition — use provided sensor directly, no guessing
-        conditions = by_role[ROLE_CONDITION]
-        self._attr_condition = conditions[0] if conditions else None
+        # Condition — majority vote over the window. Keep the last known
+        # condition if nothing came in this window rather than blanking it.
+        conditions = buffers[ROLE_CONDITION]
+        if conditions:
+            self._attr_condition = Counter(conditions).most_common(1)[0][0]
 
         # Dew point and apparent temp only if humidity available
         if humidity is not None:
@@ -264,9 +312,10 @@ class SensorsToWeatherEntity(WeatherEntity, RestoreEntity):
         self._attr_available = temp is not None
 
         _LOGGER.debug(
-            "Updated: temp=%s (min=%s, max=%s), humidity=%s, condition=%s",
+            "Flushed: temp=%s (min=%s, max=%s), humidity=%s, condition=%s, samples=%d",
             temp, self._temp_min, self._temp_max,
             humidity, self._attr_condition,
+            sum(len(v) for v in buffers.values()),
         )
 
     @property
