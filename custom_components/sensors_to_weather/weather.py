@@ -14,6 +14,8 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_change,
 )
+from homeassistant.helpers.restore_state import RestoreEntity
+import homeassistant.util.dt as dt_util
 
 from .const import (
     DOMAIN,
@@ -43,7 +45,7 @@ async def async_setup_entry(
     async_add_entities([SensorsToWeatherEntity(hass, entry, sensors, name)])
 
 
-class SensorsToWeatherEntity(WeatherEntity):
+class SensorsToWeatherEntity(WeatherEntity, RestoreEntity):
     """A weather entity built from local sensors."""
 
     _attr_has_entity_name = True
@@ -79,6 +81,8 @@ class SensorsToWeatherEntity(WeatherEntity):
             _LOGGER.exception("Error during initial update: %s", err)
 
     async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        await self._restore_daily_min_max()
         self._setup_tracking()
         self.async_on_remove(
             async_track_time_change(
@@ -86,6 +90,28 @@ class SensorsToWeatherEntity(WeatherEntity):
                 self._handle_midnight_reset,
                 hour=0, minute=0, second=0,
             )
+        )
+
+    async def _restore_daily_min_max(self) -> None:
+        """Restore temperature_min/max from the last known state, same day only."""
+        last_state = await self.async_get_last_state()
+        if last_state is None:
+            return
+
+        if dt_util.as_local(last_state.last_changed).date() != dt_util.now().date():
+            # Last known state is from a previous day — a midnight reset
+            # would have happened anyway, so start fresh.
+            return
+
+        temp_min = last_state.attributes.get("temperature_min")
+        temp_max = last_state.attributes.get("temperature_max")
+        if temp_min is not None:
+            self._temp_min = temp_min
+        if temp_max is not None:
+            self._temp_max = temp_max
+        _LOGGER.debug(
+            "Restored daily min/max after restart: min=%s, max=%s",
+            self._temp_min, self._temp_max,
         )
 
     def _setup_tracking(self) -> None:
